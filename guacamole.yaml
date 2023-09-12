@@ -1,0 +1,115 @@
+---
+- name: guacamole
+  hosts: "{{ target }}"
+  gather_facts: true
+  become: false
+  tasks:
+    - name: Set variables for rootless install
+      set_fact:
+        config_folder: /mnt/storage/centos/guac
+        folder_group: centos
+        folder_user: centos
+      
+    - name: Set container_command = docker for rhel7/debian
+      set_fact:
+        container_command: docker
+      when:
+        - (ansible_os_family == 'RedHat' and ansible_distribution_major_version == "7") or ansible_os_family == 'Debian'
+
+    - name: Set container_command = podman for rhel8
+      set_fact:
+        container_command: podman
+      when:
+        - ansible_os_family == 'RedHat' and ansible_distribution_major_version == "8"
+
+    - name: Guacamole data dir
+      file:
+        path: "{{ config_folder }}"
+        state: directory
+        owner: "{{ folder_user }}"
+        group: "{{ folder_group }}"
+        mode: '0750'
+
+    - name: Determine db passwords set (root)
+      stat:
+        path: "{{ config_folder }}/guacdb_root_file"
+      register: guacdb_root_file
+
+    - name: Determine db passwords set (guacamole)
+      stat:
+        path: "{{ config_folder }}/guacdb_guacamole_file"
+      register: guacdb_guacamole_file
+
+    - name: Create db passwords when not set (root)
+      shell: |
+        head /dev/urandom | tr -dc A-Za-z0-9 | head -c 20 > {{ config_folder }}/guacdb_root_file
+      when: guacdb_root_file.stat.exists|bool == False
+
+    - name: Create db passwords when not set (guacamole)
+      shell: |
+        head /dev/urandom | tr -dc A-Za-z0-9 | head -c 20 > {{ config_folder }}/guacdb_guacamole_file
+      when: guacdb_guacamole_file.stat.exists|bool == False
+
+    - name: Register db passwords
+      shell: |
+        cat "{{ config_folder }}/guacdb_root_file"
+      register: guacdb_root_pass
+
+    - name: Register db pass (guacamole)
+      shell: |
+        cat "{{ config_folder }}/guacdb_guacamole_file"
+      register: guacdb_guacamole_pass
+
+    - name: Docker Volume (db)
+      shell: |
+        {{ container_command }} volume create guacdb
+
+    - name: Container Launch - podman
+      shell: |
+        {{ container_command }} pod create --name guac --publish 8080:8080 --publish 5901:5901 --publish 6901:6901 --publish 8443:8443
+        {{ container_command }} run -d --pod guac --name vnc -e VNC_PW=my-pw -e VNC_RESOLUTION=1920x1080 consol/rocky-xfce-vnc
+        {{ container_command }} run -d --pod guac --name tls localhost/tls
+        {{ container_command }} run -d --pod guac --name guacd guacamole/guacd
+        {{ container_command }} run -d --pod guac --name guacdb --volume guacdb:/var/lib/mysql:Z -e MYSQL_ROOT_PASSWORD={{ guacdb_root_pass.stdout }} mysql/mysql-server
+        {{ container_command }} run -d --pod guac --name guacamole -e MYSQL_HOSTNAME=localhost -e MYSQL_PORT=3306 -e MYSQL_DATABASE=guacamole_db -e MYSQL_USER=guacamole_user -e MYSQL_PASSWORD={{ guacdb_guacamole_pass.stdout }} -e GUACD_HOSTNAME=guacd -e GUACD_PORT=4822 -e GUACD_LOG_LEVEL=debug guacamole/guacamole
+      when:
+        - container_command == 'podman'
+
+    - name: Determine if (One Time) was done
+      stat:
+        path: "{{ config_folder }}/one_time_done"
+      register: guacdb_one_time_done
+
+    - name: Set my.cnf and dbpass.sql
+      template:
+        src: "{{ item }}"
+        dest: "{{ config_folder }}/{{ item }}"
+        owner: "{{ folder_user }}"
+        group: "{{ folder_group }}"
+        mode: '0400'
+      with_items:
+        - my.cnf
+        - dbpass.sql
+      when: guacdb_one_time_done.stat.exists|bool == False
+
+    - name: Wait for mysqld on 3306
+      shell: |
+        {{ container_command }} logs guacdb 2>&1 | grep --quiet 'port: 3306'
+      register: wait_for_mysqld
+      until: wait_for_mysqld.rc == 0
+      retries: 15
+      delay: 15
+      when: guacdb_one_time_done.stat.exists|bool == False
+
+    - name: Configure DB (One Time)
+      shell: |
+        # credentials
+        {{ container_command }} cp {{ config_folder }}/my.cnf guacdb:/root/.my.cnf
+        {{ container_command }} cp {{ config_folder }}/dbpass.sql guacdb:dbpass.sql
+        {{ container_command }} exec -i guacdb /bin/bash -c "mysql < dbpass.sql"
+        touch "{{ config_folder }}/one_time_done"
+        # schema
+        {{ container_command }} exec -i guacamole /bin/bash -c 'cat /opt/guacamole/mysql/schema/*.sql' > {{ config_folder }}/dbschema.sql
+        {{ container_command }} cp {{ config_folder }}/dbschema.sql guacdb:dbschema.sql
+        {{ container_command }} exec -i guacdb /bin/bash -c "mysql guacamole_db < dbschema.sql"
+      when: guacdb_one_time_done.stat.exists|bool == False
