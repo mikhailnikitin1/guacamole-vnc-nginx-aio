@@ -8,7 +8,7 @@ cd tls
 $ ./generate_certs_and_build.sh
 
 # local example (RHEL8)
-$ ansible-playbook guacamole.yml --extra-vars="target=localhost"
+$ ansible-playbook guacamole.yaml --extra-vars="target=localhost"
 ```
 
 # Notes
