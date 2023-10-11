@@ -6,7 +6,7 @@
   tasks:
     - name: Set variables for rootless install
       set_fact:
-        config_folder: /mnt/storage/centos/guac
+        config_folder: "{{ config_folder_var }}"
         folder_group: centos
         folder_user: centos
       
